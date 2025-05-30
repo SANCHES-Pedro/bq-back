@@ -1,5 +1,6 @@
 # Sessions directory
 sessions/
+ai-implementation-docs/
 
 # Python
 __pycache__/
@@ -22,6 +23,6 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
-
+.env
 # Logs
 *.log 
