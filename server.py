@@ -8,14 +8,21 @@ import wave
 import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import speechmatics
+import openai
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+# OpenAI configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+TEMPLATE_FILE = os.getenv("REPORT_TEMPLATE_FILE", "templates/report_brazil.md")
 
 # Speechmatics configuration
 SM_URL = os.getenv("SM_URL", "wss://eu2.rt.speechmatics.com/v2")
@@ -263,12 +270,21 @@ async def websocket_proxy(client_ws: WebSocket):
     await client_ws.accept()
     log.info("Client connected")
     
+    # Get session ID from query parameters
+    session_id = client_ws.query_params.get("session_id")
+    if not session_id:
+        # Fallback to generating one if not provided (for backward compatibility)
+        session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log.warning("No session_id provided, generated fallback: {session_id}")
+    else:
+        log.info(f"Using provided session_id: {session_id}")
+    
     # Create session
-    session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     session = TranscriptionSession(session_id)
     
     # Send initial connection message
     await client_ws.send_text("Connected to server successfully!")
+    await client_ws.send_text(f"Using session ID: {session_id}")
 
     # Create Speechmatics handler
     sm_handler = SpeechmaticsHandler(message_sender_callback, session)
@@ -335,6 +351,124 @@ async def websocket_proxy(client_ws: WebSocket):
         audio_file, transcript_json, transcript_txt = session.save_session()
         log.info(f"Session ended. Total chunks: {chunk_count}")
         log.info(f"Session files saved: {audio_file}, {transcript_json}, {transcript_txt}")
+        
+        # Send session timestamp to client before closing
+        try:
+            await client_ws.send_text(f"SESSION_ENDED:{session_id}")
+        except:
+            pass
+
+
+# ------------------------------------------------------------------
+# Medical‑report generation utilities
+# ------------------------------------------------------------------
+def generate_medical_report(
+    transcript_path: str,
+    template_path: str = TEMPLATE_FILE,
+    model: str = "gpt-4o-mini",
+) -> str:
+    """
+    Generate a structured medical report in Markdown given the raw
+    consultation transcript and a template file.
+
+    Parameters
+    ----------
+    transcript_path : str
+        Path to the plain‑text transcript produced by the transcription session.
+    template_path : str
+        Path to the Markdown template that defines the report structure.
+    model : str
+        OpenAI model identifier.
+
+    Returns
+    -------
+    str
+        Completed medical report in Markdown.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY environment variable not set")
+
+    if not os.path.exists(transcript_path):
+        raise FileNotFoundError(f"Transcript file not found: {transcript_path}")
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Template file not found: {template_path}")
+
+    # Load transcript and template
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        transcript = f.read()
+    with open(template_path, "r", encoding="utf-8") as f:
+        template = f.read()
+
+    # Build prompt
+    prompt = (
+        "Você é um médico assistente virtual especializado em redação de "
+        "prontuários. Leia a conversa abaixo e preencha o template a seguir. "
+        "Mantenha os títulos em português exatamente como estão no template. "
+        "Deixe campos em branco caso a informação não esteja presente.\n\n"
+        "Nao faça nenhuma hipótese diagnóstica, apenas preencha o template com as informações presentes na transcrição.\n"
+        f"### TRANSCRIÇÃO DA CONSULTA\n```\n{transcript}\n```\n\n"
+        f"### TEMPLATE\n{template}\n\n"
+        "### PRONTUÁRIO COMPLETO"
+    )
+
+    response = openai.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content.strip()
+
+
+@app.get("/report/{session_timestamp}")
+async def get_medical_report(session_timestamp: str):
+    """
+    Return a generated medical report for the given session timestamp.
+
+    The timestamp must match the suffix used in the saved session files,
+    e.g. '20250602_153045'.
+    """
+    log.info(f"Received request for medical report with timestamp: {session_timestamp}")
+    base = os.path.join("sessions", f"session_{session_timestamp}")
+    transcript_path = f"{base}_transcript.txt"
+    log.info(f"Looking for transcript at: {transcript_path}")
+
+    try:
+        log.info("Starting report generation...")
+        report_md = generate_medical_report(transcript_path)
+        log.info("Report generation completed successfully")
+    except FileNotFoundError:
+        log.error(f"Transcript file not found at: {transcript_path}")
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    except RuntimeError as exc:
+        log.error(f"Runtime error during report generation: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        log.error(f"Unexpected error during report generation: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Persist generated report alongside the transcript
+    report_path = f"{base}_report.md"
+    try:
+        log.info(f"Saving report to: {report_path}")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report_md)
+        log.info("Report saved successfully")
+    except Exception as exc:
+        log.error(f"Could not save report: {exc}")
+
+    return {"report": report_md}
+
+
+@app.post("/end-session/{session_timestamp}")
+async def end_session(session_timestamp: str):
+    """
+    Manually end a session and save its data.
+    This is useful when the WebSocket connection doesn't close properly.
+    """
+    log.info(f"Manual session end requested for: {session_timestamp}")
+    # For now, just return success - the actual session data is saved via WebSocket
+    # This endpoint can be extended later if needed
+    return {"message": f"Session {session_timestamp} ended manually", "session_id": session_timestamp}
 
 
 if __name__ == "__main__":
