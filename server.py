@@ -13,6 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import speechmatics
 import openai
+from pydantic import BaseModel
+class ReportRequest(BaseModel):
+    transcript: str
+    template: str
+    unspoken_notes: str
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -362,6 +367,12 @@ async def websocket_proxy(client_ws: WebSocket):
 # ------------------------------------------------------------------
 # Medical‑report generation utilities
 # ------------------------------------------------------------------
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for AWS deployment monitoring"""
+    return {"status": "healthy", "service": "ai-backend"}
+
 def generate_medical_report(
     transcript_path: str,
     template_path: str = TEMPLATE_FILE,
@@ -419,57 +430,37 @@ def generate_medical_report(
     return response.choices[0].message.content.strip()
 
 
-@app.get("/report/{session_timestamp}")
-async def get_medical_report(session_timestamp: str):
+
+
+@app.post("/report")
+async def get_medical_report(request: ReportRequest):
     """
-    Return a generated medical report for the given session timestamp.
-
-    The timestamp must match the suffix used in the saved session files,
-    e.g. '20250602_153045'.
+    Generate and return a medical report given raw transcript and template strings.
     """
-    log.info(f"Received request for medical report with timestamp: {session_timestamp}")
-    base = os.path.join("sessions", f"session_{session_timestamp}")
-    transcript_path = f"{base}_transcript.txt"
-    log.info(f"Looking for transcript at: {transcript_path}")
-
+    prompt = (
+        "Você é um médico assistente virtual especializado em redação de "
+        "prontuários. Leia a conversa abaixo, leve em conta as anotações não ditas "
+        "pelo clínico e preencha o template a seguir. Mantenha os títulos em português "
+        "exatamente como estão no template. Deixe campos em branco caso a informação "
+        "não esteja presente.\n\n"
+        "Nao faça nenhuma hipótese diagnóstica, apenas preencha o template com as "
+        "informações presentes na transcrição e nas anotações do clínico.\n"
+        f"### TRANSCRIÇÃO DA CONSULTA\n```{request.transcript}```\n\n"
+        f"### ANOTAÇÕES NÃO DITAS (dos clínico)\n```{request.unspoken_notes}```\n\n"
+        f"### TEMPLATE\n{request.template}\n\n"
+        "### PRONTUÁRIO COMPLETO"
+    )
     try:
-        log.info("Starting report generation...")
-        report_md = generate_medical_report(transcript_path)
-        log.info("Report generation completed successfully")
-    except FileNotFoundError:
-        log.error(f"Transcript file not found at: {transcript_path}")
-        raise HTTPException(status_code=404, detail="Transcript not found")
-    except RuntimeError as exc:
-        log.error(f"Runtime error during report generation: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        report_md = response.choices[0].message.content.strip()
     except Exception as exc:
-        log.error(f"Unexpected error during report generation: {exc}")
+        log.error(f"Error generating report: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
-
-    # Persist generated report alongside the transcript
-    report_path = f"{base}_report.md"
-    try:
-        log.info(f"Saving report to: {report_path}")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(report_md)
-        log.info("Report saved successfully")
-    except Exception as exc:
-        log.error(f"Could not save report: {exc}")
-
     return {"report": report_md}
-
-
-@app.post("/end-session/{session_timestamp}")
-async def end_session(session_timestamp: str):
-    """
-    Manually end a session and save its data.
-    This is useful when the WebSocket connection doesn't close properly.
-    """
-    log.info(f"Manual session end requested for: {session_timestamp}")
-    # For now, just return success - the actual session data is saved via WebSocket
-    # This endpoint can be extended later if needed
-    return {"message": f"Session {session_timestamp} ended manually", "session_id": session_timestamp}
-
 
 if __name__ == "__main__":
     if not SM_TOKEN:
