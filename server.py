@@ -43,17 +43,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# SSL configuration for production
-ssl_keyfile = os.getenv("SSL_KEYFILE")
-ssl_certfile = os.getenv("SSL_CERTFILE")
-
 # Configure uvicorn settings
 uvicorn_config = {
     "host": "0.0.0.0",
-    "port": int(os.getenv("PORT", "8000")),
-    "ssl_keyfile": ssl_keyfile if ssl_keyfile else None,
-    "ssl_certfile": ssl_certfile if ssl_certfile else None,
-}
+    "port": int(os.getenv("PORT", "8000"))
+    }
 
 class AudioStream:
     """File-like object that provides audio data to Speechmatics SDK"""
