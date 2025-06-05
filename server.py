@@ -37,11 +37,7 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://app.escribamed.com",
-        "https://api.escribamed.com",
-        "http://localhost:3000"  # For local development
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
