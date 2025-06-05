@@ -27,7 +27,6 @@ log = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
-TEMPLATE_FILE = os.getenv("REPORT_TEMPLATE_FILE", "templates/report_brazil.md")
 
 # Speechmatics configuration
 SM_URL = os.getenv("SM_URL", "wss://eu2.rt.speechmatics.com/v2")
@@ -38,11 +37,27 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend URL
+    allow_origins=[
+        "https://app.escribamed.com",
+        "https://api.escribamed.com",
+        "http://localhost:3000"  # For local development
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# SSL configuration for production
+ssl_keyfile = os.getenv("SSL_KEYFILE")
+ssl_certfile = os.getenv("SSL_CERTFILE")
+
+# Configure uvicorn settings
+uvicorn_config = {
+    "host": "0.0.0.0",
+    "port": int(os.getenv("PORT", "8000")),
+    "ssl_keyfile": ssl_keyfile if ssl_keyfile else None,
+    "ssl_certfile": ssl_certfile if ssl_certfile else None,
+}
 
 class AudioStream:
     """File-like object that provides audio data to Speechmatics SDK"""
@@ -373,63 +388,6 @@ async def health_check():
     """Health check endpoint for AWS deployment monitoring"""
     return {"status": "healthy", "service": "ai-backend"}
 
-def generate_medical_report(
-    transcript_path: str,
-    template_path: str = TEMPLATE_FILE,
-    model: str = "gpt-4o-mini",
-) -> str:
-    """
-    Generate a structured medical report in Markdown given the raw
-    consultation transcript and a template file.
-
-    Parameters
-    ----------
-    transcript_path : str
-        Path to the plain‑text transcript produced by the transcription session.
-    template_path : str
-        Path to the Markdown template that defines the report structure.
-    model : str
-        OpenAI model identifier.
-
-    Returns
-    -------
-    str
-        Completed medical report in Markdown.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY environment variable not set")
-
-    if not os.path.exists(transcript_path):
-        raise FileNotFoundError(f"Transcript file not found: {transcript_path}")
-    if not os.path.exists(template_path):
-        raise FileNotFoundError(f"Template file not found: {template_path}")
-
-    # Load transcript and template
-    with open(transcript_path, "r", encoding="utf-8") as f:
-        transcript = f.read()
-    with open(template_path, "r", encoding="utf-8") as f:
-        template = f.read()
-
-    # Build prompt
-    prompt = (
-        "Você é um médico assistente virtual especializado em redação de "
-        "prontuários. Leia a conversa abaixo e preencha o template a seguir. "
-        "Mantenha os títulos em português exatamente como estão no template. "
-        "Deixe campos em branco caso a informação não esteja presente.\n\n"
-        "Nao faça nenhuma hipótese diagnóstica, apenas preencha o template com as informações presentes na transcrição.\n"
-        f"### TRANSCRIÇÃO DA CONSULTA\n```\n{transcript}\n```\n\n"
-        f"### TEMPLATE\n{template}\n\n"
-        "### PRONTUÁRIO COMPLETO"
-    )
-
-    response = openai.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-    )
-    return response.choices[0].message.content.strip()
-
-
 
 
 @app.post("/report")
@@ -466,5 +424,5 @@ if __name__ == "__main__":
     if not SM_TOKEN:
         log.error("Please set SPEECHMATICS_API_TOKEN environment variable")
     else:
-        log.info(f"Starting server on port 8000...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        log.info(f"Starting server on port {uvicorn_config['port']}...")
+    uvicorn.run("server:app", **uvicorn_config)

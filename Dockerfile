@@ -18,8 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create directories for sessions and templates
-RUN mkdir -p sessions templates
+# Create directory for sessions
+RUN mkdir -p sessions
 
 # Expose port
 EXPOSE 8000

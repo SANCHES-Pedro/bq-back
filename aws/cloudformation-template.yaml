@@ -20,6 +20,16 @@ Parameters:
     Type: String
     Description: ARN of the AWS Secrets Manager secret containing Speechmatics API token
 
+  DomainName:
+    Type: String
+    Description: Domain name for the SSL certificate
+    Default: "api.escribamed.com"
+
+  HostedZoneId:
+    Type: String
+    Description: Route53 Hosted Zone ID for escribamed.com
+    Default: ""
+
 Resources:
   # VPC and Networking
   VPC:
@@ -157,19 +167,49 @@ Resources:
       HealthCheckPath: /health
       HealthCheckProtocol: HTTP
       HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 5
+      HealthCheckTimeoutSeconds: 10
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-tg"
 
-  ALBListener:
+  # SSL Certificate
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-cert"
+
+  # HTTPS Listener
+  HTTPSListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref SSLCertificate
+
+  # HTTP to HTTPS Redirect
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            Host: '#{host}'
+            Path: '/#{path}'
+            Query: '#{query}'
+            StatusCode: HTTP_301
       LoadBalancerArn: !Ref ApplicationLoadBalancer
       Port: 80
       Protocol: HTTP
@@ -243,20 +283,17 @@ Resources:
       ContainerDefinitions:
         - Name: !Sub "${ProjectName}-container"
           Image: !Ref ContainerImage
+          Essential: true
           PortMappings:
             - ContainerPort: 8000
               Protocol: tcp
-          Essential: true
           Environment:
-            - Name: SM_URL
-              Value: "wss://eu2.rt.speechmatics.com/v2"
-            - Name: REPORT_TEMPLATE_FILE
-              Value: "templates/report_brazil.md"
-          Secrets:
             - Name: OPENAI_API_KEY
-              ValueFrom: !Ref OpenAIApiKeySecretArn
+              Value: !Sub "{{resolve:secretsmanager:${OpenAIApiKeySecretArn}:SecretString}}"
             - Name: SPEECHMATICS_API_TOKEN
-              ValueFrom: !Ref SpeechmaticsTokenSecretArn
+              Value: !Sub "{{resolve:secretsmanager:${SpeechmaticsTokenSecretArn}:SecretString}}"
+            - Name: ALLOWED_ORIGINS
+              Value: !Sub "https://${DomainName}"
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -274,14 +311,15 @@ Resources:
 
   # ECS Service
   ECSService:
+    DependsOn: HTTPSListener
     Type: AWS::ECS::Service
-    DependsOn: ALBListener
     Properties:
       ServiceName: !Sub "${ProjectName}-service"
       Cluster: !Ref ECSCluster
       TaskDefinition: !Ref ECSTaskDefinition
       DesiredCount: 1
       LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
@@ -291,25 +329,66 @@ Resources:
           SecurityGroups:
             - !Ref ECSSecurityGroup
       LoadBalancers:
-        - TargetGroupArn: !Ref ALBTargetGroup
-          ContainerName: !Sub "${ProjectName}-container"
+        - ContainerName: !Sub "${ProjectName}-container"
           ContainerPort: 8000
+          TargetGroupArn: !Ref ALBTargetGroup
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-service"
 
+  # Route53 Record Set
+  ApiDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
 Outputs:
   LoadBalancerURL:
     Description: URL of the Application Load Balancer
-    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+    Value: !Sub "https://${DomainName}"
     Export:
       Name: !Sub "${ProjectName}-alb-url"
+      
+  LoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${ProjectName}-alb-dns"
+  
+  DomainName:
+    Description: Domain name for the API
+    Value: !Ref DomainName
+    Export:
+      Name: !Sub "${ProjectName}-domain-name"
+      
+  WebSocketURL:
+    Description: WebSocket URL for the API
+    Value: !Sub "wss://${DomainName}/ws"
+    Export:
+      Name: !Sub "${ProjectName}-websocket-url"
+      
+  CertificateArn:
+    Description: ARN of the SSL Certificate
+    Value: !Ref SSLCertificate
+    Export:
+      Name: !Sub "${ProjectName}-certificate-arn"
   
   ECSClusterName:
     Description: Name of the ECS Cluster
     Value: !Ref ECSCluster
     Export:
       Name: !Sub "${ProjectName}-cluster-name"
+      
+  ECSServiceName:
+    Description: Name of the ECS Service
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub "${ProjectName}-service-name"
       
   LogGroupName:
     Description: CloudWatch Log Group Name
