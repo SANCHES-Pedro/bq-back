@@ -16,6 +16,7 @@ import openai
 import boto3
 from pydantic import BaseModel
 
+
 class ReportRequest(BaseModel):
     transcript: str
     template: str
@@ -394,31 +395,64 @@ async def health_check():
     """Health check endpoint for AWS deployment monitoring"""
     return {"status": "healthy", "service": "ai-backend"}
 
-
-
 @app.post("/report")
 async def get_medical_report(request: ReportRequest):
     """
     Generate and return a medical report given raw transcript and template strings.
     """
-    prompt = (
-        "Você é um médico assistente virtual especializado em redação de "
-        "prontuários. Leia a conversa abaixo, leve em conta as anotações não ditas "
-        "pelo clínico e preencha o template a seguir. Mantenha os títulos em português "
-        "exatamente como estão no template. Deixe campos em branco caso a informação "
-        "não esteja presente.\n\n"
-        "Nao faça nenhuma hipótese diagnóstica, apenas preencha o template com as "
-        "informações presentes na transcrição e nas anotações do clínico.\n"
-        f"### TRANSCRIÇÃO DA CONSULTA\n```{request.transcript}```\n\n"
-        f"### ANOTAÇÕES NÃO DITAS (dos clínico)\n```{request.unspoken_notes}```\n\n"
-        f"### TEMPLATE\n{request.template}\n\n"
-        "### PRONTUÁRIO COMPLETO"
+    PROMPT_TEMPLATE = """
+        ### SISTEMA
+        Você é um assistente médico virtual especialista em redação de prontuários clínicos.
+
+        ### CONTEXTO
+        Receberá:
+        - A transcrição completa de uma consulta.
+        - Anotações do clínico que não foram ditas ao paciente.
+        - Um template em Markdown cujos headings começam com “##”.
+
+        ### TAREFA
+        A partir do template dado e instrucoes de cada headings, extraia as informacoes relevantes e preencha o template **exatamente** como especificado, usando somente:
+        1. Informações encontradas na transcrição.
+        2. Informações das anotações não ditas.
+
+
+
+        ### REGRAS
+        - **Não** proponha hipóteses diagnósticas adicionais.
+        - **Não** mude, renomeie ou reordene nenhum heading “##”.
+        - Siga as instruções/exemplos presentes logo abaixo de cada heading para saber o que esperar, **mas** remova essas instruções/exemplos no resultado final. As instruções/exemplos sao indicadas pelo símbolo ">" em markdown no inicio de cada linha.
+        - Se o dado estiver ausente, deixe o campo em branco ou insira “—”.
+        - Mantenha o texto 100 % em português.
+        - A saída deve ser **apenas** o template completo preenchido, em Markdown, sem explicações extras.
+
+        ### ENTRADA
+        #### TRANSCRIÇÃO
+        ```
+        {transcript}
+        ```
+        ANOTAÇÕES_NAO_DITAS
+        ```
+        {unspoken_notes}
+        ```
+        TEMPLATE
+        ```
+        {template}
+        ```
+        SAÍDA
+
+        Retorne somente o template preenchido a seguir.
+        Não inclua esta linha de instrução na resposta.
+        """
+    prompt = PROMPT_TEMPLATE.format(
+        transcript=request.transcript,
+        unspoken_notes=request.unspoken_notes,
+        template=request.template
     )
+    
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="o4-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
         )
         report_md = response.choices[0].message.content.strip()
     except Exception as exc:
