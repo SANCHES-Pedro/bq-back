@@ -13,7 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import speechmatics
 import openai
+import boto3
 from pydantic import BaseModel
+
 class ReportRequest(BaseModel):
     transcript: str
     template: str
@@ -27,6 +29,16 @@ log = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
+
+# ------------------------------------------------------------------
+# AWS S3 configuration
+# ------------------------------------------------------------------
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")  # Name of the bucket that will hold session artefacts
+if not S3_BUCKET_NAME:
+    log.warning("S3_BUCKET_NAME environment variable is not set; session files will NOT be uploaded to S3.")
+else:
+    s3_client = boto3.client("s3", region_name=AWS_REGION)
 
 # Speechmatics configuration
 SM_URL = os.getenv("SM_URL", "wss://eu2.rt.speechmatics.com/v2")
@@ -127,47 +139,51 @@ class TranscriptionSession:
             'text': text,
             'is_partial': is_partial
         })
-        
-    def save_session(self, output_dir='sessions'):
-        """Save the complete session (audio + transcripts)"""
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Generate filename with timestamp
+
+    def save_session(self):
+        """
+        Assemble the recorded audio and transcript entirely in‑memory and upload them to S3.
+        Returns the S3 URIs of the stored artefacts.
+        """
+        if not S3_BUCKET_NAME:
+            raise RuntimeError("S3_BUCKET_NAME is not configured – cannot upload session to S3.")
+
+        # Build unique object keys
         timestamp = self.start_time.strftime('%Y%m%d_%H%M%S')
-        base_filename = f"{output_dir}/session_{timestamp}"
-        
-        # Save audio as WAV file
-        audio_filename = f"{base_filename}.wav"
-        with wave.open(audio_filename, 'wb') as wav_file:
+        audio_key = f"{self.session_id}/audio.wav"
+        txt_key   = f"{self.session_id}/transcript.txt"
+
+        # ---- Audio (WAV) ----
+        audio_buffer = io.BytesIO()
+        with wave.open(audio_buffer, 'wb') as wav_file:
             wav_file.setnchannels(self.channels)
             wav_file.setsampwidth(self.sample_width)
             wav_file.setframerate(self.sample_rate)
-            
-            # Combine all audio chunks
+
+            # Write every recorded chunk
             for chunk in self.audio_chunks:
                 wav_file.writeframes(chunk)
-        
-        # Save transcripts as JSON
-        transcript_filename = f"{base_filename}_transcript.json"
-        session_data = {
-            'session_id': self.session_id,
-            'start_time': self.start_time.isoformat(),
-            'duration': (datetime.now() - self.start_time).total_seconds(),
-            'transcripts': self.transcripts
-        }
-        
-        with open(transcript_filename, 'w') as f:
-            json.dump(session_data, f, indent=2)
-        
-        # Also save a plain text version
-        text_filename = f"{base_filename}_transcript.txt"
-        with open(text_filename, 'w') as f:
-            for entry in self.transcripts:
-                if not entry['is_partial']:
-                    f.write(f"[{entry['timestamp']:.2f}s] {entry['text']}\n")
-        
-        log.info(f"Session saved: {audio_filename}, {transcript_filename}, {text_filename}")
-        return audio_filename, transcript_filename, text_filename
+        audio_buffer.seek(0)  # rewind for upload
+
+        s3_client.upload_fileobj(audio_buffer, S3_BUCKET_NAME, audio_key)
+
+        # ---- Transcript (TXT) ----
+        transcript_str = "".join(
+            f"[{entry['timestamp']:.2f}s] {entry['text']}\n"
+            for entry in self.transcripts
+            if not entry['is_partial']
+        )
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=txt_key,
+            Body=transcript_str.encode("utf-8"),
+            ContentType="text/plain",
+        )
+
+        audio_uri = f"s3://{S3_BUCKET_NAME}/{audio_key}"
+        txt_uri   = f"s3://{S3_BUCKET_NAME}/{txt_key}"
+        log.info(f"Session uploaded to S3: {audio_uri}, {txt_uri}")
+        return audio_uri, txt_uri
 
 
 class SpeechmaticsHandler:
@@ -358,9 +374,9 @@ async def websocket_proxy(client_ws: WebSocket):
         executor.shutdown(wait=False)
         
         # Save session data
-        audio_file, transcript_json, transcript_txt = session.save_session()
+        audio_file, transcript_txt = session.save_session()
         log.info(f"Session ended. Total chunks: {chunk_count}")
-        log.info(f"Session files saved: {audio_file}, {transcript_json}, {transcript_txt}")
+        log.info(f"Session files saved: {audio_file}, {transcript_txt}")
         
         # Send session timestamp to client before closing
         try:
